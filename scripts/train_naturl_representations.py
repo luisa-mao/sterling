@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 
 """code to train the representation learning from the spot data"""
+import sys
+import os
+
+# Add the top-level project directory to the Python path
+project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(project_dir)
 
 import torch
 torch.multiprocessing.set_sharing_strategy('file_system') #https://github.com/pytorch/pytorch/issues/11201
@@ -199,7 +205,7 @@ class NATURLDataModule(pl.LightningDataModule):
             print('imu_data.shape : ', imu_data.shape)
             print('leg_data.shape : ', leg_data.shape)
             print('feet_data.shape : ', feet_data.shape)
-            exit()
+            # exit() # why?
             
             imu_data = imu_data.reshape(-1, imu_data.shape[-1])
             leg_data = leg_data.reshape(-1, leg_data.shape[-1])
@@ -226,8 +232,8 @@ class NATURLDataModule(pl.LightningDataModule):
             pickle.dump(data_statistics, open(self.data_config_path + '/data_statistics.pkl', 'wb'))
             
         # load the train data
-        self.train_dataset = ConcatDataset([TerrainDataset(pickle_files_root, incl_orientation=self.include_orientation_imu, data_stats=data_statistics, train=True, psd=self.psd) for pickle_files_root in self.data_config['train']])
-        self.val_dataset = ConcatDataset([TerrainDataset(pickle_files_root, incl_orientation=self.include_orientation_imu, data_stats=data_statistics, psd=self.psd) for pickle_files_root in self.data_config['val']])
+        self.train_dataset = ConcatDataset([TerrainDataset(pickle_files_root, incl_orientation=self.include_orientation_imu, data_stats=data_statistics, train=True) for pickle_files_root in self.data_config['train']])
+        self.val_dataset = ConcatDataset([TerrainDataset(pickle_files_root, incl_orientation=self.include_orientation_imu, data_stats=data_statistics) for pickle_files_root in self.data_config['val']])
         
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, 
@@ -581,8 +587,8 @@ if __name__ == '__main__':
                         help='learning rate (default: 3e-4)')
     parser.add_argument('--l1_coeff', type=float, default=0.5, metavar='L1C',
                         help='L1 loss coefficient (1)')
-    parser.add_argument('--num_gpus','-g', type=int, default=2, metavar='N',
-                        help='number of GPUs to use (default: 8)')
+    parser.add_argument('--num_devices','-g', type=int, default=2, metavar='N',
+                        help='number of devices to use (default: 8)')
     parser.add_argument('--latent_size', type=int, default=128, metavar='N',
                         help='Size of the common latent space (default: 128)')
     parser.add_argument('--save', type=int, default=0, metavar='N',
@@ -598,7 +604,7 @@ if __name__ == '__main__':
     tb_logger = pl_loggers.TensorBoardLogger(save_dir="naturl_reptraining_logs/")
     
     print("Training the representation learning model...")
-    trainer = pl.Trainer(gpus=list(np.arange(args.num_gpus)),
+    trainer = pl.Trainer(devices=list(np.arange(args.num_devices)),
                          max_epochs=args.epochs,
                          log_every_n_steps=10,
                          strategy='ddp',
