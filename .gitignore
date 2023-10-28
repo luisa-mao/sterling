@@ -11,3 +11,4 @@ __pycache__/
 /*embeddings*/
 
 jackal_data/*
+spot_data/*

@@ -1,0 +1,7 @@
+l1_coeff: 0.5
+lambd: 3.9e-06
+latent_size: 128
+lr: 0.0003
+rep_size: 128
+scale_loss: 0.03125
+weight_decay: 1.0e-06

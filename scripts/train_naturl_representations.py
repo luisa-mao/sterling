@@ -236,10 +236,13 @@ class NATURLDataModule(pl.LightningDataModule):
         self.val_dataset = ConcatDataset([TerrainDataset(pickle_files_root, incl_orientation=self.include_orientation_imu, data_stats=data_statistics) for pickle_files_root in self.data_config['val']])
         
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, 
+        d = DataLoader(self.train_dataset, batch_size=self.batch_size, 
                           num_workers=self.num_workers, shuffle=True, 
                           drop_last= True if len(self.train_dataset) % self.batch_size != 0 else False,
                           pin_memory=True)
+        # print the length of d
+        cprint('the length of the train_dataloader is : {}'.format(len(d)), 'green')
+        return d
     
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.batch_size, 
@@ -374,7 +377,7 @@ class NATURLRepresentationsModel(pl.LightningModule):
         # return torch.optim.SGD(self.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
         # return torch.optim.RMSprop(self.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
     
-    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx):
+    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx =0):
         # save the batch data only every other epoch or during the last epoch
         if self.current_epoch % 10 == 0 or self.current_epoch == self.trainer.max_epochs-1:
             patch1, patch2, inertial, leg, feet, label, sampleidx = batch
@@ -604,7 +607,8 @@ if __name__ == '__main__':
     tb_logger = pl_loggers.TensorBoardLogger(save_dir="naturl_reptraining_logs/")
     
     print("Training the representation learning model...")
-    trainer = pl.Trainer(devices=list(np.arange(args.num_devices)),
+    # trainer = pl.Trainer(devices=list(np.arange(args.num_devices, dtype=int)),
+    trainer = pl.Trainer(
                          max_epochs=args.epochs,
                          log_every_n_steps=10,
                          strategy='ddp',
