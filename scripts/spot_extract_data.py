@@ -330,10 +330,10 @@ class RosbagParser:
 
                 # scale/re-type patch corners
                 scaled_patch_corners = [
-                    (patch_corners_prev_frame[0] * 150).astype(np.int),
-                    (patch_corners_prev_frame[1] * 150).astype(np.int),
-                    (patch_corners_prev_frame[2] * 150).astype(np.int),
-                    (patch_corners_prev_frame[3] * 150).astype(np.int),
+                    (patch_corners_prev_frame[0] * 150).astype(int),
+                    (patch_corners_prev_frame[1] * 150).astype(int),
+                    (patch_corners_prev_frame[2] * 150).astype(int),
+                    (patch_corners_prev_frame[3] * 150).astype(int),
                 ]
                 
                 # create individual image frame for patch
@@ -425,10 +425,10 @@ class RosbagParser:
         ]
         
         scaled_patch_corners = [
-            (patch_corners_prev_frame[0] * 150).astype(np.int),
-            (patch_corners_prev_frame[1] * 150).astype(np.int),
-            (patch_corners_prev_frame[2] * 150).astype(np.int),
-            (patch_corners_prev_frame[3] * 150).astype(np.int),
+            (patch_corners_prev_frame[0] * 150).astype(int),
+            (patch_corners_prev_frame[1] * 150).astype(int),
+            (patch_corners_prev_frame[2] * 150).astype(int),
+            (patch_corners_prev_frame[3] * 150).astype(int),
         ]
         
         CENTER = np.array((1476//2, 749//2 + 320))
