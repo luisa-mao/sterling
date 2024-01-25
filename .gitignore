@@ -12,3 +12,5 @@ __pycache__/
 
 jackal_data/*
 spot_data/*
+tmp/*
+*logs*

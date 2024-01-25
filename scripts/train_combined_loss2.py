@@ -20,6 +20,7 @@ import torch.nn.functional as F
 import tensorboard as tb
 import cv2
 from tqdm import tqdm
+from torch.nn import TripletMarginLoss
 
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
@@ -29,6 +30,7 @@ import argparse
 import yaml
 import os
 from sklearn import metrics
+from scripts.combined_dataset import SplitTerrainDataModule, NATURLDataModule, ZeroDataModule
 
 
 from scipy.signal import periodogram
@@ -72,184 +74,6 @@ FEET_TOPIC_RATE = 24.0
 LEG_TOPIC_RATE = 24.0
 IMU_TOPIC_RATE = 200.0
 
-class TerrainDataset(Dataset):
-    def __init__(self, pickle_files_root, incl_orientation=False, 
-                 data_stats=None, train=False):
-        self.pickle_files_paths = glob.glob(pickle_files_root + '/*.pkl')
-        # print("length of terrain dataset is : ", (len(self.pickle_files_paths)))
-        self.label = pickle_files_root.split('/')[-2]
-        # self.label = terrain_label[self.label]
-        self.incl_orientation = incl_orientation
-        self.data_stats = data_stats
-        
-        if self.data_stats is not None:
-            self.min, self.max = data_stats['min'], data_stats['max']
-            self.mean, self.std = data_stats['mean'], data_stats['std']
-        
-        if train:
-            self.transforms = get_transforms()
-        else:
-            self.transforms = None
-    
-    def __len__(self):
-        return len(self.pickle_files_paths)
-    
-    def __getitem__(self, idx):
-        with open(self.pickle_files_paths[idx], 'rb') as f:
-            data = pickle.load(f)
-        imu, feet, leg = data['imu'], data['feet'], data['leg']
-        patches = data['patches']
-    
-        # process the feet data to remove the mu and std values for non-contacting feet
-        feet = process_feet_data(feet)
-        
-        if not self.incl_orientation: imu = imu[:, :-4]
-
-        imu = periodogram(imu, fs=IMU_TOPIC_RATE, axis=0)[1]
-        leg = periodogram(leg, fs=LEG_TOPIC_RATE, axis=0)[1]
-        feet = periodogram(feet, fs=FEET_TOPIC_RATE, axis=0)[1]
-        
-        # normalize the imu data
-        # if self.mean is not None and self.std is not None:
-        if self.data_stats is not None:
-            # #minmax normalization
-            imu = (imu - self.min['imu']) / (self.max['imu'] - self.min['imu'] + 1e-7)
-            imu = imu.flatten()
-            imu = imu.reshape(1, -1)
-            
-            leg = (leg - self.min['leg']) / (self.max['leg'] - self.min['leg'] + 1e-7)
-            leg = leg.flatten()
-            leg = leg.reshape(1, -1)
-            
-            feet = (feet - self.min['feet']) / (self.max['feet'] - self.min['feet'] + 1e-7)
-            feet = feet.flatten()
-            feet = feet.reshape(1, -1)
-            
-        # sample 2 values between 0 and num_patches-1
-        # patch_1_idx, patch_2_idx = np.random.choice(len(patches), 2, replace=False)
-        
-        # sample a number between 0 and (num_patches-1)/2
-        patch_1_idx = np.random.randint(0, len(patches)//2)
-        # sample a number between (num_patches-1)/2 and num_patches-1
-        patch_2_idx = np.random.randint(len(patches)//2, len(patches))
-        
-        # patch1_idx, patch2_idx = np.random.choice(num_patches, 2, replace=False)
-        patch1, patch2 = patches[patch_1_idx], patches[patch_2_idx]
-        # patch1, patch2 = os.path.join(patches, f'{patch1_idx}.png'), os.path.join(patches, f'{patch2_idx}.png')
-        # patch1, patch2 = cv2.imread(patch1), cv2.imread(patch2)
-        
-        # convert BGR to RGB
-        patch1, patch2 = cv2.cvtColor(patch1, cv2.COLOR_BGR2RGB), cv2.cvtColor(patch2, cv2.COLOR_BGR2RGB)
-        
-        # apply the transforms
-        if self.transforms is not None:
-            patch1 = self.transforms(image=patch1)['image']
-            patch2 = self.transforms(image=patch2)['image']
-        
-        # normalize the image patches
-        patch1 = np.asarray(patch1, dtype=np.float32) / 255.0
-        patch2 = np.asarray(patch2, dtype=np.float32) / 255.0
-        
-        # transpose
-        patch1, patch2 = np.transpose(patch1, (2, 0, 1)), np.transpose(patch2, (2, 0, 1))
-        
-        return np.asarray(patch1), np.asarray(patch2), imu, leg, feet, self.label, idx
-
-# create pytorch lightning data module
-class NATURLDataModule(pl.LightningDataModule):
-    def __init__(self, data_config_path, batch_size=64, num_workers=2, include_orientation_imu=False):
-        super().__init__()
-        
-        # read the yaml file
-        cprint('Reading the yaml file at : {}'.format(data_config_path), 'green')
-        self.data_config = yaml.load(open(data_config_path, 'r'), Loader=yaml.FullLoader)
-        self.data_config_path = '/'.join(data_config_path.split('/')[:-1])
-
-        self.include_orientation_imu = include_orientation_imu
-
-        self.batch_size, self.num_workers = batch_size, num_workers
-        
-        self.mean, self.std = {}, {}
-        self.min, self.max = {}, {}
-        
-        # load the train and val datasets
-        self.load()
-        cprint('Train dataset size : {}'.format(len(self.train_dataset)), 'green')
-        cprint('Val dataset size : {}'.format(len(self.val_dataset)), 'green')
-        
-        
-    def load(self):
-        
-        # check if the data_statistics.pkl file exists
-        if os.path.exists(self.data_config_path + '/data_statistics.pkl'):
-            cprint('Loading the mean and std from the data_statistics.pkl file', 'green')
-            data_statistics = pickle.load(open(self.data_config_path + '/data_statistics.pkl', 'rb'))
-            # self.mean, self.std = data_statistics['mean'], data_statistics['std']
-            # self.min, self.max = data_statistics['min'], data_statistics['max']
-            
-        else:
-            # find the mean and std of the train dataset
-            cprint('data_statistics.pkl file not found!', 'yellow')
-            cprint('Finding the mean and std of the train dataset', 'green')
-            self.tmp_dataset = ConcatDataset([TerrainDataset(pickle_files_root, incl_orientation=self.include_orientation_imu) for pickle_files_root in self.data_config['train']])
-            self.tmp_dataloader = DataLoader(self.tmp_dataset, batch_size=128, num_workers=2, shuffle=False)
-            cprint('the length of the tmp_dataloader is : {}'.format(len(self.tmp_dataloader)), 'green')
-            # find the mean and std of the train dataset
-            imu_data, leg_data, feet_data = [], [], []
-            for _, _, imu, leg, feet, _, _ in tqdm(self.tmp_dataloader):
-                imu_data.append(imu.cpu().numpy())
-                leg_data.append(leg.cpu().numpy())
-                feet_data.append(feet.cpu().numpy())
-            imu_data = np.concatenate(imu_data, axis=0)
-            leg_data = np.concatenate(leg_data, axis=0)
-            feet_data = np.concatenate(feet_data, axis=0)
-            print('imu_data.shape : ', imu_data.shape)
-            print('leg_data.shape : ', leg_data.shape)
-            print('feet_data.shape : ', feet_data.shape)
-            # exit() # why?
-            
-            imu_data = imu_data.reshape(-1, imu_data.shape[-1])
-            leg_data = leg_data.reshape(-1, leg_data.shape[-1])
-            feet_data = feet_data.reshape(-1, feet_data.shape[-1])
-            
-            self.mean['imu'], self.std['imu'] = np.mean(imu_data, axis=0), np.std(imu_data, axis=0)
-            self.min['imu'], self.max['imu'] = np.min(imu_data, axis=0), np.max(imu_data, axis=0)
-            
-            self.mean['leg'], self.std['leg'] = np.mean(leg_data, axis=0), np.std(leg_data, axis=0)
-            self.min['leg'], self.max['leg'] = np.min(leg_data, axis=0), np.max(leg_data, axis=0)
-            
-            self.mean['feet'], self.std['feet'] = np.mean(feet_data, axis=0), np.std(feet_data, axis=0)
-            self.min['feet'], self.max['feet'] = np.min(feet_data, axis=0), np.max(feet_data, axis=0)
-            
-            cprint('Mean : {}'.format(self.mean), 'green')
-            cprint('Std : {}'.format(self.std), 'green')
-            cprint('Min : {}'.format(self.min), 'green')
-            cprint('Max : {}'.format(self.max), 'green')
-            
-            # save the mean and std
-            cprint('Saving the mean, std, min, max to the data_statistics.pkl file', 'green')
-            data_statistics = {'mean': self.mean, 'std': self.std, 'min': self.min, 'max': self.max}
-            
-            pickle.dump(data_statistics, open(self.data_config_path + '/data_statistics.pkl', 'wb'))
-            
-        # load the train data
-        self.train_dataset = ConcatDataset([TerrainDataset(pickle_files_root, incl_orientation=self.include_orientation_imu, data_stats=data_statistics, train=True) for pickle_files_root in self.data_config['train']])
-        self.val_dataset = ConcatDataset([TerrainDataset(pickle_files_root, incl_orientation=self.include_orientation_imu, data_stats=data_statistics) for pickle_files_root in self.data_config['val']])
-        
-    def train_dataloader(self):
-        d = DataLoader(self.train_dataset, batch_size=self.batch_size, 
-                          num_workers=self.num_workers, shuffle=True, 
-                          drop_last= True if len(self.train_dataset) % self.batch_size != 0 else False,
-                          pin_memory=True)
-        # print the length of d
-        cprint('the length of the train_dataloader is : {}'.format(len(d)), 'green')
-        return d
-    
-    def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, 
-                          num_workers=self.num_workers, shuffle=True, 
-                          drop_last= False,
-                          pin_memory=True)
 
 
 class NATURLRepresentationsModel(pl.LightningModule):
@@ -287,22 +111,67 @@ class NATURLRepresentationsModel(pl.LightningModule):
         self.cov_coeff = 1.0
         
         self.max_acc = None
+
+        self.triplet_loss = TripletMarginLoss(margin=1.0, p=2)
+        # initialie the weights
+#         self.apply(initialize_weights)
+
+# def initialize_weights(model):
+#     torch.manual_seed(0)
+#     if isinstance(model, nn.Module):
+#         for module in model.modules():
+#             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+#                 nn.init.xavier_uniform_(module.weight)
+#                 if module.bias is not None:
+#                     nn.init.constant_(module.bias, 0)
+#             elif isinstance(module, nn.BatchNorm2d):
+#                 nn.init.constant_(module.weight, 1)
+#                 nn.init.constant_(module.bias, 0)
         
     
-    def forward(self, patch1, patch2, inertial_data, leg, feet):
+    # def forward(self, patch1, patch2, neg_patch, inertial_data, leg, feet):
+    def forward(self, triplet_data, vicreg_data):
+        anch_patch, pos_patch, neg_patch = triplet_data
+        patch1, patch2, inertial_data, leg, feet = vicreg_data
+
+        # for triplet loss
+        v_encoded_anch = self.visual_encoder(anch_patch.float())
+        v_encoded_anch = F.normalize(v_encoded_anch, dim=-1)
+        v_encoded_pos = self.visual_encoder(pos_patch.float())
+        v_encoded_pos = F.normalize(v_encoded_pos, dim=-1)
+        v_encoded_neg = self.visual_encoder(neg_patch.float())
+        v_encoded_neg = F.normalize(v_encoded_neg, dim=-1)   
+
+        # print ("in forward step")   
+        # # print the shapes of the triplet data input
+        # print("anch_patch shape: ", anch_patch.shape)
+        # print("pos_patch shape: ", pos_patch.shape)
+        # print("neg_patch shape: ", neg_patch.shape)
+        # # print the shapes of the triplet data output
+        # print("v_encoded_anch shape: ", v_encoded_anch.shape)
+        # print("v_encoded_pos shape: ", v_encoded_pos.shape)
+        # print("v_encoded_neg shape: ", v_encoded_neg.shape)
+        # print("end forward step")
+
+        
+
+        # for vicreg
         v_encoded_1 = self.visual_encoder(patch1.float())
         v_encoded_1 = F.normalize(v_encoded_1, dim=-1)
         v_encoded_2 = self.visual_encoder(patch2.float())
-        v_encoded_2 = F.normalize(v_encoded_2, dim=-1)        
-        
+        v_encoded_2 = F.normalize(v_encoded_2, dim=-1)  
         # i_encoded = self.inertial_encoder(inertial_data.float())
         i_encoded = self.proprioceptive_encoder(inertial_data.float(), leg.float(), feet.float())
         
         zv1 = self.projector(v_encoded_1)
         zv2 = self.projector(v_encoded_2)
         zi = self.projector(i_encoded)
+
+        triplet_out = [v_encoded_anch, v_encoded_pos, v_encoded_neg]
+        vicreg_out = [zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded]
         
-        return zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded
+        return triplet_out, vicreg_out
+    
     
     def vicreg_loss(self, z1, z2):
         repr_loss = F.mse_loss(z1, z2)
@@ -331,46 +200,99 @@ class NATURLRepresentationsModel(pl.LightningModule):
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(c)
             
-    def training_step(self, batch, batch_idx):
-        patch1, patch2, inertial, leg, feet, label, _ = batch
-        
-        # combine inertial and leg data
-        # inertial = torch.cat((inertial, leg, feet), dim=-1)
+    # def training_step(self, batch, batch_idx):  
+    #     pass
+    def training_step(self, batch, batch_idx):  
+        # pass      
+        # print the current epoch
+        print("training step current epoch: ", self.current_epoch)
+        anch_patch, pos_patch, neg_patch, t_label, _ = batch[0] # triplet data
+        patch1, patch2, inertial, leg, feet, v_label, _ = batch[1] # vicreg data
 
-        zv1, zv2, zi, _, _, _ = self.forward(patch1, patch2, inertial, leg, feet)
-        
+        # print anch patch shape
+        # print("anch_patch shape: ", anch_patch.shape)
+
+        triplet_data = [anch_patch, pos_patch, neg_patch]
+        vicreg_data = [patch1, patch2, inertial, leg, feet]
+
+        triplet_out, vicreg_out = self.forward(triplet_data, vicreg_data)
+        v_encoded_anch, v_encoded_pos, v_encoded_neg = triplet_out
+        zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
         # compute viewpoint invariance vicreg loss
         loss_vpt_inv = self.vicreg_loss(zv1, zv2)
         # compute visual-inertial vicreg loss
         loss_vi = 0.5 * self.vicreg_loss(zv1, zi) + 0.5 * self.vicreg_loss(zv2, zi)
+        v_loss = self.l1_coeff * loss_vpt_inv + (1.0-self.l1_coeff) * loss_vi
+
+        # triplet loss
+        # print (v_encoded_anch.shape, v_encoded_pos.shape, v_encoded_neg.shape)
+        # t_loss = self.triplet_loss(v_encoded_anch, v_encoded_pos, v_encoded_neg)
+        # loss = v_loss * 2/3 + t_loss * 1/3 # change coefficients here
+        loss = v_loss
+
         
-        loss = self.l1_coeff * loss_vpt_inv + (1.0-self.l1_coeff) * loss_vi
-        
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train_loss_vpt_inv', loss_vpt_inv, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train_loss_vi', loss_vi, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        # self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('train_loss_vpt_inv', loss_vpt_inv, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('train_loss_vi', loss_vi, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
+        # log batch size
+        self.logger.experiment.add_scalar("Batch Size", patch1.shape[0], self.current_epoch)
+
+        # print vloss, tloss, and total loss
+        # print("vloss: ", v_loss)
+        # print("tloss: ", t_loss)
+        # print("total loss: ", loss)
+
+        # print("end training step")
         
         return loss
     
+    # def validation_step(self, batch, batch_idx):
+    #     pass
     def validation_step(self, batch, batch_idx):
-        patch1, patch2, inertial, leg, feet, label, _ = batch
-        
-        # combine inertial and leg data
-        # inertial = torch.cat((inertial, leg, feet), dim=-1)
-        
-        zv1, zv2, zi, _, _, _ = self.forward(patch1, patch2, inertial, leg, feet)
-        
+        # pass
+        anch_patch, pos_patch, neg_patch, t_label, _ = batch[0] # triplet data
+        patch1, patch2, inertial, leg, feet, v_label, _ = batch[1] # vicreg data
+
+
+        # check if the batch size of the triplet data is 128
+        # if neg_patch.shape[0] != 128:
+        #     print("neg_patch shape is not 128: ")
+        #     print("  anch_patch shape: ", anch_patch.shape)
+        #     print("  pos_patch shape: ", pos_patch.shape)
+        #     print("  neg_patch shape: ", neg_patch.shape)
+
+        triplet_data = [anch_patch, pos_patch, neg_patch]
+        vicreg_data = [patch1, patch2, inertial, leg, feet]
+
+        triplet_out, vicreg_out = self.forward(triplet_data, vicreg_data)
+        v_encoded_anch, v_encoded_pos, v_encoded_neg = triplet_out
+        zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
+
+        # Check if any of the shapes is not [128, 128]
+        # if v_encoded_anch.shape != (128, 128):
+        #     print("v_encoded_anch shape is not [128, 128]:", v_encoded_anch.shape)
+        # if v_encoded_pos.shape != (128, 128):
+        #     print("v_encoded_pos shape is not [128, 128]:", v_encoded_pos.shape)
+        # if v_encoded_neg.shape != (128, 128):
+        #     print("v_encoded_anch shape:", v_encoded_anch.shape)
+        #     print("v_encoded_pos shape:", v_encoded_pos.shape)
+        #     print("v_encoded_neg shape:", v_encoded_neg.shape)
+
         # compute viewpoint invariance vicreg loss
         loss_vpt_inv = self.vicreg_loss(zv1, zv2)
         # compute visual-inertial vicreg loss
         loss_vi = 0.5 * self.vicreg_loss(zv1, zi) + 0.5 * self.vicreg_loss(zv2, zi)
-        
-        loss = self.l1_coeff * loss_vpt_inv + (1.0-self.l1_coeff) * loss_vi
-        
-        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val_loss_vpt_inv', loss_vpt_inv, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val_loss_vi', loss_vi, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
+        v_loss = self.l1_coeff * loss_vpt_inv + (1.0-self.l1_coeff) * loss_vi
+
+        # triplet loss
+        t_loss = self.triplet_loss(v_encoded_anch, v_encoded_pos, v_encoded_neg)
+        loss = v_loss * 2/3 + t_loss * 1/3 # change coefficients here
+
+        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('val_loss_vpt_inv', loss_vpt_inv, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('val_loss_vi', loss_vi, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
         return loss
     
     def configure_optimizers(self):
@@ -378,15 +300,16 @@ class NATURLRepresentationsModel(pl.LightningModule):
         # return torch.optim.SGD(self.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
         # return torch.optim.RMSprop(self.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
     
-    def aon_validation_batch_start(self, batch, batch_idx, dataloader_idx =0):
+    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx =0):
         # save the batch data only every other epoch or during the last epoch
         if self.current_epoch % 10 == 0 or self.current_epoch == self.trainer.max_epochs-1:
-            patch1, patch2, inertial, leg, feet, label, sampleidx = batch
-            # combine inertial and leg data
-            # inertial = torch.cat((inertial, leg, feet), dim=-1)
-        
+            # anch_patch, pos_patch, neg_patch, t_label, _ = batch[0]
+            patch1, patch2, inertial, leg, feet, label, sampleidx = batch[1]
             with torch.no_grad():
-                _, _, _, zv1, zv2, zi = self.forward(patch1, patch2, inertial, leg, feet)
+                triplet_out, vicreg_out = self.forward(batch[0][:3], batch[1][:5])
+                zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
+            # basically a bunch of the above input is ignored. really just care about passing an image (using patch1 from vicreg)
+            # through the visual encoder and getting the embedding.
             zv1, zi = zv1.cpu(), zi.cpu()
             patch1 = patch1.cpu()
             label = np.asarray(label)
@@ -459,23 +382,48 @@ class NATURLRepresentationsModel(pl.LightningModule):
 
             # save grid image
             new_im.save(path_root +"group"+str(i)+".png")
+
+    def on_epoch_end(self):
+        # print the current epoch
+        print("epoch end current epoch: ", self.current_epoch)
     
     def validate(self):
         print('Running validation...')
-        dataset = self.trainer.datamodule.val_dataset
+        # dataset = self.trainer.datamodule.val_dataset
         self.visual_encoding, self.inertial_encoding, self.label, self.visual_patch, self.sampleidx = [], [], [], [], []
         # create dataloader for validation
-        dataset = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=4)
+        # dataset = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=4)
+        # get the val dataloader from the datamodule
+        val_dataloader = self.trainer.datamodule.val_dataloader()
         
-        for patch1, patch2, inertial, leg, feet, label, sampleidx in tqdm(dataset):
+        # for patch1, patch2, neg_patch, inertial, leg, feet, label, sampleidx in tqdm(dataset):
+        for triplet_data, vicreg_data in val_dataloader:
+            # print the shapes of the data
+            # print("triplet data: ", triplet_data.shape)
+            # print("vicreg data: ", vicreg_data.shape)
+            # triplet_data = triplet_data[:3]            
+            patch1, patch2, inertial, leg, feet, label, sampleidx = vicreg_data
+
+            # convert to torch tensors
+            # patch1, patch2, inertial, leg, feet = torch.from_numpy(patch1), torch.from_numpy(patch2), torch.from_numpy(inertial), torch.from_numpy(leg), torch.from_numpy(feet)
+            # create three empty tensors of size batch_size x 3 x 128 x 128
+            empty = torch.empty((patch1.shape[0], 3, 64, 64))
+
+            # move to device
+            patch1, patch2, inertial, leg, feet = patch1.to(self.device), patch2.to(self.device), inertial.to(self.device), leg.to(self.device), feet.to(self.device)
+            # print patch1 shape
+            empty = empty.to(self.device)
+
+
             # convert to torch tensors
             # patch1, patch2, inertial, leg, feet = torch.from_numpy(patch1), torch.from_numpy(patch2), torch.from_numpy(inertial), torch.from_numpy(leg), torch.from_numpy(feet)
             # move to device
-            patch1, patch2, inertial, leg, feet = patch1.to(self.device), patch2.to(self.device), inertial.to(self.device), leg.to(self.device), feet.to(self.device)
+            # patch1, patch2, neg_patch, inertial, leg, feet = patch1.to(self.device), patch2.to(self.device), neg_patch.to(self.device), inertial.to(self.device), leg.to(self.device), feet.to(self.device)
             
             with torch.no_grad():
-                # _, _, _, zv1, zv2, zi = self.forward(patch1.unsqueeze(0), patch2.unsqueeze(0), inertial.unsqueeze(0), leg.unsqueeze(0), feet.unsqueeze(0))
-                _, _, _, zv1, zv2, zi = self.forward(patch1, patch2, inertial, leg, feet)
+                triplet_out, vicreg_out = self.forward([empty, empty, empty], [patch1, patch2, inertial, leg, feet])
+                # v_encoded_anch, v_encoded_pos, v_encoded_neg = triplet_out
+                zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
                 zv1, zi = zv1.cpu(), zi.cpu()
                 patch1 = patch1.cpu()
                 
@@ -490,22 +438,17 @@ class NATURLRepresentationsModel(pl.LightningModule):
         self.inertial_encoding = torch.cat(self.inertial_encoding, dim=0)
         self.sampleidx = torch.cat(self.sampleidx, dim=0)
         self.label = np.concatenate(self.label)
+        print("validation end")
         
         # print('Visual Encoding Shape: {}'.format(self.visual_encoding.shape))
         # print('Inertial Encoding Shape: {}'.format(self.inertial_encoding.shape))
         # print('Visual Patch Shape: {}'.format(self.visual_patch.shape))
         # print('Sample Index Shape: {}'.format(self.sampleidx.shape))
     
-    def aon_validation_end(self):
+    def a_on_validation_end(self):
+        # print("on validation end")
         if (self.current_epoch % 10 == 0 or self.current_epoch == self.trainer.max_epochs-1) and torch.cuda.current_device() == 0:
             self.validate()
-            
-            # self.visual_patch = torch.cat(self.visual_patch, dim=0)
-            # self.visual_encoding = torch.cat(self.visual_encoding, dim=0)
-            # self.inertial_encoding = torch.cat(self.inertial_encoding, dim=0)
-            # self.sampleidx = torch.cat(self.sampleidx, dim=0)
-            
-            # cprint('Visual Encoding Shape: {}'.format(self.visual_encoding.shape), 'white', attrs=['bold'])
             
             # randomize index selections
             idx = np.arange(self.visual_encoding.shape[0])
@@ -547,6 +490,9 @@ class NATURLRepresentationsModel(pl.LightningModule):
             if self.current_epoch % 10 == 0:
                 self.logger.experiment.add_embedding(mat=data[idx[:2500]], label_img=vis_patch[idx[:2500]], global_step=self.current_epoch, metadata=ll[idx[:2500]], tag='visual_encoding')
             del self.visual_patch, self.visual_encoding, self.inertial_encoding, self.label
+
+            # print the current epoch
+            print("current epoch: ", self.current_epoch)
     
     def save_models(self, path_root='./models/'):
         cprint('saving models...', 'yellow', attrs=['bold'])
@@ -600,12 +546,15 @@ if __name__ == '__main__':
     parser.add_argument('--imu_in_rep', type=int, default=1, metavar='N',
                         help='Whether to include the inertial data in the representation')
     parser.add_argument('--data_config_path', type=str, default='spot_data/data_config.yaml')
+    parser.add_argument('--save_dir', type=str, default='combined_loss_logs/',
+                        help='Directory to save logs and checkpoints')
     args = parser.parse_args()
     
     model = NATURLRepresentationsModel(lr=args.lr, latent_size=args.latent_size, l1_coeff=args.l1_coeff)
-    dm = NATURLDataModule(data_config_path=args.data_config_path, batch_size=args.batch_size)
+    dm = SplitTerrainDataModule(data_config_path=args.data_config_path, batch_size=args.batch_size)
+    # dm = ZeroDataModule(128*20)
     
-    tb_logger = pl_loggers.TensorBoardLogger(save_dir="naturl_baseline_logs/")
+    tb_logger = pl_loggers.TensorBoardLogger(save_dir=args.save_dir)
     
     print("Training the representation learning model...")
     # trainer = pl.Trainer(devices=list(np.arange(args.num_devices, dtype=int)),
@@ -618,6 +567,7 @@ if __name__ == '__main__':
                          sync_batchnorm=True,
                          gradient_clip_val=100.0,
                          gradient_clip_algorithm='norm',
+                         devices=args.num_devices
                          )
 
     # fit the model

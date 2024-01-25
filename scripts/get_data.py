@@ -25,9 +25,9 @@ def process_file(line):
                 print(f'Found: {file_path}')
                 output_dir = ''
                 if 'train' in line:
-                    output_dir = os.path.join('spot_data', 'train', terrain_label, bag_name)
+                    output_dir = os.path.join('spot_data', 'train', terrain_label)
                 elif 'test' in line:
-                    output_dir = os.path.join('spot_data', 'test', terrain_label, bag_name)
+                    output_dir = os.path.join('spot_data', 'test', terrain_label)
                 command = f'python3 scripts/spot_extract_data.py -b {file_path} -o {output_dir}'
                 print(f'Running: {command}')
                 os.system(command)
