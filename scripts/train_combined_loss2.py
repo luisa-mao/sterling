@@ -30,7 +30,7 @@ import argparse
 import yaml
 import os
 from sklearn import metrics
-from scripts.combined_dataset import SplitTerrainDataModule, NATURLDataModule, ZeroDataModule
+from scripts.combined_dataset import SplitTerrainDataModule
 
 
 from scipy.signal import periodogram
@@ -77,7 +77,7 @@ IMU_TOPIC_RATE = 200.0
 
 
 class NATURLRepresentationsModel(pl.LightningModule):
-    def __init__(self, lr=3e-4, latent_size=64, scale_loss=1.0/32, lambd=3.9e-6, weight_decay=1e-6, l1_coeff=0.5, rep_size=128):
+    def __init__(self, lr=3e-4, latent_size=64, scale_loss=1.0/32, lambd=3.9e-6, weight_decay=1e-6, l1_coeff=0.5, rep_size=128, devices=[0], use_imu=True):
         super(NATURLRepresentationsModel, self).__init__()
         
         self.save_hyperparameters(
@@ -93,22 +93,24 @@ class NATURLRepresentationsModel(pl.LightningModule):
         self.lr, self.latent_size, self.scale_loss, self.lambd, self.weight_decay = lr, latent_size, scale_loss, lambd, weight_decay
         self.l1_coeff = l1_coeff
         self.rep_size = rep_size
+        self.devices = devices
         
         # visual encoder architecture
         self.visual_encoder = VisualEncoderEfficientModel(latent_size=rep_size)
         # self.visual_encoder = VisualEncoderEfficientModel(latent_size=rep_size)
         
-        self.proprioceptive_encoder = ProprioceptionModel(latent_size=rep_size)
-        
+        if use_imu:
+            self.proprioceptive_encoder = ProprioceptionModel(latent_size=rep_size)
+            # coefficients for vicreg loss
+            self.sim_coeff = 25.0
+            self.std_coeff = 25.0
+            self.cov_coeff = 1.0
+            
         self.projector = nn.Sequential(
             nn.Linear(rep_size, latent_size), nn.ReLU(inplace=True),
             nn.Linear(latent_size, latent_size)
         )
-        
-        # coefficients for vicreg loss
-        self.sim_coeff = 25.0
-        self.std_coeff = 25.0
-        self.cov_coeff = 1.0
+            
         
         self.max_acc = None
 
@@ -137,10 +139,13 @@ class NATURLRepresentationsModel(pl.LightningModule):
         # for triplet loss
         v_encoded_anch = self.visual_encoder(anch_patch.float())
         v_encoded_anch = F.normalize(v_encoded_anch, dim=-1)
+        v_enchoded_anch = self.projector(v_encoded_anch)
         v_encoded_pos = self.visual_encoder(pos_patch.float())
         v_encoded_pos = F.normalize(v_encoded_pos, dim=-1)
+        v_encoded_pos = self.projector(v_encoded_pos)
         v_encoded_neg = self.visual_encoder(neg_patch.float())
-        v_encoded_neg = F.normalize(v_encoded_neg, dim=-1)   
+        v_encoded_neg = F.normalize(v_encoded_neg, dim=-1)  
+        v_encoded_neg = self.projector(v_encoded_neg) 
 
         # print ("in forward step")   
         # # print the shapes of the triplet data input
@@ -199,23 +204,8 @@ class NATURLRepresentationsModel(pl.LightningModule):
     def all_reduce(self, c):
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(c)
-            
-    # def training_step(self, batch, batch_idx):  
-    #     pass
-    def training_step(self, batch, batch_idx):  
-        # pass      
-        # print the current epoch
-        print("training step current epoch: ", self.current_epoch)
-        anch_patch, pos_patch, neg_patch, t_label, _ = batch[0] # triplet data
-        patch1, patch2, inertial, leg, feet, v_label, _ = batch[1] # vicreg data
 
-        # print anch patch shape
-        # print("anch_patch shape: ", anch_patch.shape)
-
-        triplet_data = [anch_patch, pos_patch, neg_patch]
-        vicreg_data = [patch1, patch2, inertial, leg, feet]
-
-        triplet_out, vicreg_out = self.forward(triplet_data, vicreg_data)
+    def calculate_loss(self, triplet_out, vicreg_out):
         v_encoded_anch, v_encoded_pos, v_encoded_neg = triplet_out
         zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
         # compute viewpoint invariance vicreg loss
@@ -226,70 +216,58 @@ class NATURLRepresentationsModel(pl.LightningModule):
 
         # triplet loss
         # print (v_encoded_anch.shape, v_encoded_pos.shape, v_encoded_neg.shape)
-        # t_loss = self.triplet_loss(v_encoded_anch, v_encoded_pos, v_encoded_neg)
-        # loss = v_loss * 2/3 + t_loss * 1/3 # change coefficients here
+        t_loss = self.triplet_loss(v_encoded_anch, v_encoded_pos, v_encoded_neg)
+        loss = v_loss * 2/3 + t_loss * 1/3 # change coefficients here
         loss = v_loss
+        return loss, loss_vpt_inv, loss_vi, t_loss
 
-        
-        # self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('train_loss_vpt_inv', loss_vpt_inv, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('train_loss_vi', loss_vi, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-        # log batch size
-        self.logger.experiment.add_scalar("Batch Size", patch1.shape[0], self.current_epoch)
-
-        # print vloss, tloss, and total loss
-        # print("vloss: ", v_loss)
-        # print("tloss: ", t_loss)
-        # print("total loss: ", loss)
-
-        # print("end training step")
-        
-        return loss
-    
-    # def validation_step(self, batch, batch_idx):
-    #     pass
-    def validation_step(self, batch, batch_idx):
-        # pass
+            
+    def training_step(self, batch, batch_idx):  
+        # print the current epoch
+        # print("training step current epoch: ", self.current_epoch)
         anch_patch, pos_patch, neg_patch, t_label, _ = batch[0] # triplet data
         patch1, patch2, inertial, leg, feet, v_label, _ = batch[1] # vicreg data
 
-
-        # check if the batch size of the triplet data is 128
-        # if neg_patch.shape[0] != 128:
-        #     print("neg_patch shape is not 128: ")
-        #     print("  anch_patch shape: ", anch_patch.shape)
-        #     print("  pos_patch shape: ", pos_patch.shape)
-        #     print("  neg_patch shape: ", neg_patch.shape)
+        # print anch patch shape
+        # print("anch_patch shape: ", anch_patch.shape)
 
         triplet_data = [anch_patch, pos_patch, neg_patch]
         vicreg_data = [patch1, patch2, inertial, leg, feet]
 
+        loss, loss_vpt_inv, loss_vi, t_loss = self.calculate_loss(*self.forward(triplet_data, vicreg_data))
+
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('train_triplet_loss', t_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('train_loss_vpt_inv', loss_vpt_inv, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('train_loss_vi', loss_vi, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
+        # log batch size
+        # self.logger.experiment.add_scalar("Batch Size", patch1.shape[0], self.current_epoch)        
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        anch_patch, pos_patch, neg_patch, t_label, _ = batch[0] # triplet data
+        patch1, patch2, inertial, leg, feet, v_label, _ = batch[1] # vicreg data
+        triplet_data = [anch_patch, pos_patch, neg_patch]
+        vicreg_data = [patch1, patch2, inertial, leg, feet]
+
         triplet_out, vicreg_out = self.forward(triplet_data, vicreg_data)
-        v_encoded_anch, v_encoded_pos, v_encoded_neg = triplet_out
-        zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
+        # v_encoded_anch, v_encoded_pos, v_encoded_neg = triplet_out
+        # zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
 
-        # Check if any of the shapes is not [128, 128]
-        # if v_encoded_anch.shape != (128, 128):
-        #     print("v_encoded_anch shape is not [128, 128]:", v_encoded_anch.shape)
-        # if v_encoded_pos.shape != (128, 128):
-        #     print("v_encoded_pos shape is not [128, 128]:", v_encoded_pos.shape)
-        # if v_encoded_neg.shape != (128, 128):
-        #     print("v_encoded_anch shape:", v_encoded_anch.shape)
-        #     print("v_encoded_pos shape:", v_encoded_pos.shape)
-        #     print("v_encoded_neg shape:", v_encoded_neg.shape)
+        # # compute viewpoint invariance vicreg loss
+        # loss_vpt_inv = self.vicreg_loss(zv1, zv2)
+        # # compute visual-inertial vicreg loss
+        # loss_vi = 0.5 * self.vicreg_loss(zv1, zi) + 0.5 * self.vicreg_loss(zv2, zi)
+        # v_loss = self.l1_coeff * loss_vpt_inv + (1.0-self.l1_coeff) * loss_vi
 
-        # compute viewpoint invariance vicreg loss
-        loss_vpt_inv = self.vicreg_loss(zv1, zv2)
-        # compute visual-inertial vicreg loss
-        loss_vi = 0.5 * self.vicreg_loss(zv1, zi) + 0.5 * self.vicreg_loss(zv2, zi)
-        v_loss = self.l1_coeff * loss_vpt_inv + (1.0-self.l1_coeff) * loss_vi
-
-        # triplet loss
-        t_loss = self.triplet_loss(v_encoded_anch, v_encoded_pos, v_encoded_neg)
-        loss = v_loss * 2/3 + t_loss * 1/3 # change coefficients here
+        # # triplet loss
+        # t_loss = self.triplet_loss(v_encoded_anch, v_encoded_pos, v_encoded_neg)
+        # loss = v_loss * 2/3 + t_loss * 1/3 # change coefficients here
+        loss, loss_vpt_inv, loss_vi, t_loss = self.calculate_loss(triplet_out, vicreg_out)
 
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('val_triplet_loss', t_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log('val_loss_vpt_inv', loss_vpt_inv, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log('val_loss_vi', loss_vi, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
@@ -300,33 +278,33 @@ class NATURLRepresentationsModel(pl.LightningModule):
         # return torch.optim.SGD(self.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
         # return torch.optim.RMSprop(self.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
     
-    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx =0):
-        # save the batch data only every other epoch or during the last epoch
-        if self.current_epoch % 10 == 0 or self.current_epoch == self.trainer.max_epochs-1:
-            # anch_patch, pos_patch, neg_patch, t_label, _ = batch[0]
-            patch1, patch2, inertial, leg, feet, label, sampleidx = batch[1]
-            with torch.no_grad():
-                triplet_out, vicreg_out = self.forward(batch[0][:3], batch[1][:5])
-                zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
-            # basically a bunch of the above input is ignored. really just care about passing an image (using patch1 from vicreg)
-            # through the visual encoder and getting the embedding.
-            zv1, zi = zv1.cpu(), zi.cpu()
-            patch1 = patch1.cpu()
-            label = np.asarray(label)
-            sampleidx = sampleidx.cpu()
+    # def on_validation_batch_start(self, batch, batch_idx, dataloader_idx =0):
+    #     # save the batch data only every other epoch or during the last epoch
+    #     if self.current_epoch % 10 == 0 or self.current_epoch == self.trainer.max_epochs-1:
+    #         # anch_patch, pos_patch, neg_patch, t_label, _ = batch[0]
+    #         patch1, patch2, inertial, leg, feet, label, sampleidx = batch[1]
+    #         with torch.no_grad():
+    #             triplet_out, vicreg_out = self.forward(batch[0][:3], batch[1][:5])
+    #             zv1, zv2, zi, v_encoded_1, v_encoded_2, i_encoded = vicreg_out
+    #         # basically a bunch of the above input is ignored. really just care about passing an image (using patch1 from vicreg)
+    #         # through the visual encoder and getting the embedding.
+    #         zv1, zi = zv1.cpu(), zi.cpu()
+    #         patch1 = patch1.cpu()
+    #         label = np.asarray(label)
+    #         sampleidx = sampleidx.cpu()
             
-            if batch_idx == 0:
-                self.visual_encoding = [zv1]
-                self.inertial_encoding = [zi]
-                self.label = label
-                self.visual_patch = [patch1]
-                self.sampleidx = [sampleidx]
-            else:
-                self.visual_encoding.append(zv1)
-                self.inertial_encoding.append(zi)
-                self.label = np.concatenate((self.label, label))
-                self.visual_patch.append(patch1)
-                self.sampleidx.append(sampleidx)
+    #         if batch_idx == 0:
+    #             self.visual_encoding = [zv1]
+    #             self.inertial_encoding = [zi]
+    #             self.label = label
+    #             self.visual_patch = [patch1]
+    #             self.sampleidx = [sampleidx]
+    #         else:
+    #             self.visual_encoding.append(zv1)
+    #             self.inertial_encoding.append(zi)
+    #             self.label = np.concatenate((self.label, label))
+    #             self.visual_patch.append(patch1)
+    #             self.sampleidx.append(sampleidx)
                 
     # Find random groups of 25 images from each cluster
     def sample_clusters(self, clusters, elbow, vis_patch):
@@ -445,9 +423,8 @@ class NATURLRepresentationsModel(pl.LightningModule):
         # print('Visual Patch Shape: {}'.format(self.visual_patch.shape))
         # print('Sample Index Shape: {}'.format(self.sampleidx.shape))
     
-    def a_on_validation_end(self):
-        # print("on validation end")
-        if (self.current_epoch % 10 == 0 or self.current_epoch == self.trainer.max_epochs-1) and torch.cuda.current_device() == 0:
+    def on_validation_end(self):
+        if (self.current_epoch % 10 == 0 or self.current_epoch == self.trainer.max_epochs-1) and torch.cuda.current_device() == self.devices[0]:
             self.validate()
             
             # randomize index selections
@@ -491,8 +468,6 @@ class NATURLRepresentationsModel(pl.LightningModule):
                 self.logger.experiment.add_embedding(mat=data[idx[:2500]], label_img=vis_patch[idx[:2500]], global_step=self.current_epoch, metadata=ll[idx[:2500]], tag='visual_encoding')
             del self.visual_patch, self.visual_encoding, self.inertial_encoding, self.label
 
-            # print the current epoch
-            print("current epoch: ", self.current_epoch)
     
     def save_models(self, path_root='./models/'):
         cprint('saving models...', 'yellow', attrs=['bold'])
@@ -545,14 +520,15 @@ if __name__ == '__main__':
                         help='Whether to save the k means model and encoders at the end of the run')
     parser.add_argument('--imu_in_rep', type=int, default=1, metavar='N',
                         help='Whether to include the inertial data in the representation')
-    parser.add_argument('--data_config_path', type=str, default='spot_data/data_config.yaml')
-    parser.add_argument('--save_dir', type=str, default='combined_loss_logs/',
+    parser.add_argument('--data_config_path', type=str, default='spot_data/split_dataset_configs/full_data.yaml')
+    parser.add_argument('--save_dir', type=str, default='tmp/',
                         help='Directory to save logs and checkpoints')
     args = parser.parse_args()
+
+    devices_to_use = [4]
     
-    model = NATURLRepresentationsModel(lr=args.lr, latent_size=args.latent_size, l1_coeff=args.l1_coeff)
+    model = NATURLRepresentationsModel(lr=args.lr, latent_size=args.latent_size, l1_coeff=args.l1_coeff, devices = devices_to_use)
     dm = SplitTerrainDataModule(data_config_path=args.data_config_path, batch_size=args.batch_size)
-    # dm = ZeroDataModule(128*20)
     
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=args.save_dir)
     
@@ -567,7 +543,7 @@ if __name__ == '__main__':
                          sync_batchnorm=True,
                          gradient_clip_val=100.0,
                          gradient_clip_algorithm='norm',
-                         devices=args.num_devices
+                         devices=devices_to_use#args.num_devices
                          )
 
     # fit the model

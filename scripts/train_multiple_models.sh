@@ -18,6 +18,6 @@ data_config=$3
 
 for ((i=0; i<$loop_num; i++))
 do
-    python3 scripts/train_combined_loss.py --data_config "$data_config" --b 128 --save_dir "$save_dir"
+    python3 scripts/train_vrlpap_baseline.py --data_config_path "$data_config" --b 128 --save_dir "$save_dir"  --epochs 200
 done
 
